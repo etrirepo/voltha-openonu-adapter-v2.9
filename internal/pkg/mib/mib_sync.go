@@ -25,7 +25,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-
+  "os"
+  "bufio"
+  gp "github.com/google/gopacket"
 	"github.com/looplab/fsm"
 
 	"time"
@@ -38,6 +40,7 @@ import (
 	cmn "github.com/opencord/voltha-openonu-adapter-go/internal/pkg/common"
 	devdb "github.com/opencord/voltha-openonu-adapter-go/internal/pkg/devdb"
 	"github.com/opencord/voltha-protos/v5/go/inter_adapter"
+  omcilib "github.com/opencord/bbsim/common/omci"
 )
 
 type sLastTxMeParameter struct {
@@ -1211,4 +1214,106 @@ func (oo *OnuDeviceEntry) CancelProcessing(ctx context.Context) {
 	if pMibUlFsm != nil {
 		_ = pMibUlFsm.Event(UlEvStop)
 	}
+}
+func (oo *OnuDeviceEntry) CreateMeDB(ctx context.Context) {
+	logger.Debugw(ctx, "CreateMeDB ETRI", log.Fields{"device-id": oo.deviceID})
+	oo.pOnuDB = devdb.NewOnuDeviceDB(log.WithSpanFromContext(context.TODO(), ctx), oo.deviceID)
+}
+
+func (oo *OnuDeviceEntry) SaveScriptUploadOmcitoMeDb(ctx context.Context) {
+  fileName := "uploadOmci"
+  _, err := os.Stat(fileName)
+  if err!=nil && os.IsNotExist(err){
+    logger.Errorw(ctx, "OmciScript is Not Exist", log.Fields{"device-id":oo.deviceID, "fileNam     e":fileName})
+    panic(err)
+  }
+  data, err:= os.Open(fileName)
+  if err!=nil{
+    panic(err)
+  }
+
+  scanner :=bufio.NewScanner(data)
+  scanner.Split(bufio.ScanLines)
+  //scriptChan := make(chan bool)
+  for scanner.Scan(){
+    omciData:=scanner.Text()
+    logger.Infow(ctx, "Scanned Upload Omci Data", log.Fields{"Scan Omci:":omciData})
+//    data,err :=hex.DecodeString(omciData)
+    data := []byte(omciData)
+    logger.Infow(ctx, "ConvertData", log.Fields{"convertData:":data})
+    if err!=nil {
+      panic(err)
+    }
+    pkt, OmciMsg, err := omcilib.ParseOpenOltOmciPacket(data)
+    if err!=nil{
+      panic(err)
+    }
+    logger.Debugw(ctx,"OmciPacket out....",log.Fields{"msg":pkt, "msg address":&pkt, "omciMsg":OmciMsg})
+    oo.processSaveScript(ctx, &pkt)
+  }
+  oo.pOnuDB.LogMeDb(ctx)
+  err = oo.createAndPersistMibTemplate(ctx)
+  if err != nil {
+    logger.Errorw(ctx, "ETRI - MibTemplate - Failed to create and persist the mib template", log.Fields{"error": err, "device-id": oo.deviceID})
+  }
+
+}
+func (oo *OnuDeviceEntry) processSaveScript(ctx context.Context, msg *gp.Packet){
+  logger.Debugw(ctx, "OmciPacket in ....", log.Fields{"device-id":oo.deviceID, "msg":msg})
+  msgLayer := (*msg).Layer(omci.LayerTypeMibUploadNextResponse)
+
+	if msgLayer != nil {
+		msgObj, msgOk := msgLayer.(*omci.MibUploadNextResponse)
+		//msgObj, msgOk := msg.(*omci.MibUploadNextResponse)
+		if !msgOk {
+			logger.Errorw(ctx, "Omci Msg layer could not be assigned", log.Fields{"device-id": oo.deviceID})
+			return
+		}
+		meName := msgObj.ReportedME.GetName()
+		meClassID := msgObj.ReportedME.GetClassID()
+		meEntityID := msgObj.ReportedME.GetEntityID()
+
+		logger.Debugw(ctx, "ETRI Script Data for:", log.Fields{"device-id": oo.deviceID, "meName": meName, "data-fields": msgObj})
+
+		if meName == devdb.CUnknownItuG988ManagedEntity || meName == devdb.CUnknownVendorSpecificManagedEntity {
+			oo.pOnuDB.PutUnknownMe(ctx, devdb.UnknownMeName(meName), meClassID, meEntityID, msgObj.ReportedME.GetAttributeMask(), msgObj.BaseLayer.Payload)
+		} else {
+			//with relaxed decoding set in the OMCI-LIB we have the chance to detect if there are some unknown attributes appended which we cannot decode
+			if unknownAttrLayer := (*msg).Layer(omci.LayerTypeUnknownAttributes); unknownAttrLayer != nil {
+				logger.Warnw(ctx, "ETRI script contains unknown attributes", log.Fields{"device-id": oo.deviceID})
+				if unknownAttributes, ok := unknownAttrLayer.(*omci.UnknownAttributes); ok {
+					// provide a loop over several ME's here already in preparation of OMCI extended message format
+					for _, unknown := range unknownAttributes.Attributes {
+						unknownAttrClassID := unknown.EntityClass // ClassID
+						unknownAttrInst := unknown.EntityInstance // uint16
+						unknownAttrMask := unknown.AttributeMask  // ui
+						unknownAttrBlob := unknown.AttributeData  // []byte
+						logger.Warnw(ctx, "Etri script unknown attributes detected for", log.Fields{"device-id": oo.deviceID,
+							"Me-ClassId": unknownAttrClassID, "Me-InstId": unknownAttrInst, "unknown mask": unknownAttrMask,
+							"unknown attributes": unknownAttrBlob})
+						//TODO!!! We have to find a way to put this extra information into the (MIB)DB, see below pOnuDB.PutMe
+						//  this probably requires an (add-on) extension in the DB, that should not harm any other (get) processing -> later as a second step
+					} // for all included ME's with unknown attributes
+				} else {
+					logger.Errorw(ctx, "Etri unknownAttrLayer could not be decoded", log.Fields{"device-id": oo.deviceID})
+				}
+			}
+			oo.pOnuDB.PutMe(ctx, meClassID, meEntityID, msgObj.ReportedME.GetAttributeValueMap())
+		}
+	} else {
+		logger.Errorw(ctx, "ETRI Omci Msg layer could not be detected", log.Fields{"device-id": oo.deviceID})
+		//as long as omci-lib does not support decoding of table attribute as 'unknown/unspecified' attribute
+		//  we have to verify, if this failure is from table attribute and try to go forward with ignoring the complete message
+		errLayer := (*msg).Layer(gopacket.LayerTypeDecodeFailure)
+		if failure, decodeOk := errLayer.(*gopacket.DecodeFailure); decodeOk {
+			errMsg := failure.String()
+			if !strings.Contains(strings.ToLower(errMsg), "table decode") {
+				//something still unexected happened, needs deeper investigation - stop complete MIB upload process (timeout)
+				return
+			}
+			logger.Warnw(ctx, "Decode issue on received ETRI frame - found table attribute(s) (message ignored)",
+				log.Fields{"device-id": oo.deviceID, "issue": errMsg})
+		}
+	}
+
 }
