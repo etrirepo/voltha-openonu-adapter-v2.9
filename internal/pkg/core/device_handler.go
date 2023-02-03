@@ -24,9 +24,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
-  "os"
-  "bufio"
-  "encoding/hex"
+
 	"github.com/opencord/voltha-openonu-adapter-go/internal/pkg/config"
 
 	"github.com/gogo/protobuf/proto"
@@ -56,8 +54,6 @@ import (
 	oop "github.com/opencord/voltha-protos/v5/go/openolt"
 	"github.com/opencord/voltha-protos/v5/go/tech_profile"
 	"github.com/opencord/voltha-protos/v5/go/voltha"
-  gp "github.com/google/gopacket"
- "github.com/opencord/omci-lib-go/v2"
 )
 
 const (
@@ -209,6 +205,8 @@ type deviceHandler struct {
 	upgradeCanceled                bool
 	reconciling                    uint8
 	mutexReconcilingFlag           sync.RWMutex
+	reconcilingFirstPass           bool
+	mutexReconcilingFirstPassFlag  sync.RWMutex
 	reconcilingReasonUpdate        bool
 	mutexReconcilingReasonUpdate   sync.RWMutex
 	chUniVlanConfigReconcilingDone chan uint16 //channel to indicate that VlanConfig reconciling for a specific UNI has been finished
@@ -257,6 +255,7 @@ func newDeviceHandler(ctx context.Context, cc *vgrpc.Client, ep eventif.EventPro
 	dh.UniVlanConfigFsmMap = make(map[uint8]*avcfg.UniVlanConfigFsm)
 	dh.reconciling = cNoReconciling
 	dh.reconcilingReasonUpdate = false
+	dh.reconcilingFirstPass = true
 	dh.chReconcilingFinished = make(chan bool)
 	dh.reconcileExpiryComplete = adapter.maxTimeoutReconciling //assumption is to have it as duration in s!
 	rECSeconds := int(dh.reconcileExpiryComplete / time.Second)
@@ -1046,30 +1045,25 @@ func (dh *deviceHandler) ReconcileDeviceFlowConfig(ctx context.Context) {
 		dh.stopReconciling(ctx, true, cWaitReconcileFlowNoActivity)
 		return
 	}
-
-	if dh.IsSkipOnuConfigReconciling() {
-		//only with 'SkipOnuConfig' we need to wait for all finished-signals
-		//  from vlanConfig processing of all UNI's.
-		logger.Debugw(ctx, "reconciling flows - waiting on ready indication of requested UNIs", log.Fields{
-			"device-id": dh.DeviceID, "expiry": dh.reconcileExpiryVlanConfig})
-		if executed := loWaitGroupWTO.WaitTimeout(dh.reconcileExpiryVlanConfig); executed {
-			logger.Debugw(ctx, "reconciling flows for all UNI's has been finished in time",
-				log.Fields{"device-id": dh.DeviceID})
-			dh.stopReconciling(ctx, true, cWaitReconcileFlowAbortOnSuccess)
-			if pDevEntry != nil {
-				pDevEntry.SendChReconcilingFlowsFinished(ctx, true)
-			}
-		} else {
-			logger.Errorw(ctx, "reconciling - timeout waiting for reconciling flows for all UNI's to be finished!",
-				log.Fields{"device-id": dh.DeviceID})
-			dh.stopReconciling(ctx, false, cWaitReconcileFlowAbortOnError)
-			if pDevEntry != nil {
-				pDevEntry.SendChReconcilingFlowsFinished(ctx, false)
-			}
-			return
+	logger.Debugw(ctx, "reconciling flows - waiting on ready indication of requested UNIs", log.Fields{
+		"device-id": dh.DeviceID, "expiry": dh.reconcileExpiryVlanConfig})
+	if executed := loWaitGroupWTO.WaitTimeout(dh.reconcileExpiryVlanConfig); executed {
+		logger.Debugw(ctx, "reconciling flows for all UNI's has been finished in time",
+			log.Fields{"device-id": dh.DeviceID})
+		dh.stopReconciling(ctx, true, cWaitReconcileFlowAbortOnSuccess)
+		if pDevEntry != nil {
+			pDevEntry.SendChReconcilingFlowsFinished(ctx, true)
 		}
-		_ = dh.ReasonUpdate(ctx, cmn.DrOmciFlowsPushed, dh.IsReconcilingReasonUpdate())
+	} else {
+		logger.Errorw(ctx, "reconciling - timeout waiting for reconciling flows for all UNI's to be finished!",
+			log.Fields{"device-id": dh.DeviceID})
+		dh.stopReconciling(ctx, false, cWaitReconcileFlowAbortOnError)
+		if pDevEntry != nil {
+			pDevEntry.SendChReconcilingFlowsFinished(ctx, false)
+		}
+		return
 	}
+	_ = dh.ReasonUpdate(ctx, cmn.DrOmciFlowsPushed, dh.IsReconcilingReasonUpdate())
 }
 
 func (dh *deviceHandler) updateReconcileFlowConfig(ctx context.Context, apUniPort *cmn.OnuUniPort,
@@ -1079,28 +1073,24 @@ func (dh *deviceHandler) updateReconcileFlowConfig(ctx context.Context, apUniPor
 	lastFlowToReconcile := false
 	loUniID := apUniPort.UniID
 	for _, flowData := range aPersFlowParam {
-		if dh.IsSkipOnuConfigReconciling() {
-			if !(*apFlowsFound) {
-				*apFlowsFound = true
-				syncChannel := make(chan struct{})
-				// start go routine with select() on reconciling vlan config channel before
-				// starting vlan config reconciling process to prevent loss of any signal
-				// this routine just collects all the received 'flow-reconciled' signals - possibly from different UNI's
-				go dh.waitOnUniVlanConfigReconcilingReady(ctx, syncChannel, apWaitGroup)
-				//block until the wait routine is really blocked on channel input
-				//  in order to prevent to early ready signal from VlanConfig processing
-				<-syncChannel
-			}
-			if flowsProcessed == len(aPersFlowParam)-1 {
-				var uniAdded bool
-				lastFlowToReconcile = true
-				if aUniVlanConfigEntries, uniAdded = dh.appendIfMissing(aUniVlanConfigEntries, loUniID); uniAdded {
-					apWaitGroup.Add(1) //increment the waiting group
-				}
+		if !(*apFlowsFound) {
+			*apFlowsFound = true
+			syncChannel := make(chan struct{})
+			// start go routine with select() on reconciling vlan config channel before
+			// starting vlan config reconciling process to prevent loss of any signal
+			// this routine just collects all the received 'flow-reconciled' signals - possibly from different UNI's
+			go dh.waitOnUniVlanConfigReconcilingReady(ctx, syncChannel, apWaitGroup)
+			//block until the wait routine is really blocked on channel input
+			//  in order to prevent to early ready signal from VlanConfig processing
+			<-syncChannel
+		}
+		if flowsProcessed == len(aPersFlowParam)-1 {
+			var uniAdded bool
+			lastFlowToReconcile = true
+			if aUniVlanConfigEntries, uniAdded = dh.appendIfMissing(aUniVlanConfigEntries, loUniID); uniAdded {
+				apWaitGroup.Add(1) //increment the waiting group
 			}
 		}
-		// note for above block: also lastFlowToReconcile (as parameter to flow config below)
-		//   is only relevant in the vlanConfig processing for IsSkipOnuConfigReconciling = true
 		logger.Debugw(ctx, "reconciling - add flow with cookie slice", log.Fields{
 			"device-id": dh.DeviceID, "uni-id": loUniID,
 			"flowsProcessed": flowsProcessed, "cookies": flowData.CookieSlice})
@@ -1207,11 +1197,6 @@ func (dh *deviceHandler) SendChUniVlanConfigFinished(value uint16) {
 		default:
 		}
 	}
-}
-
-func (dh *deviceHandler) reconcileEnd(ctx context.Context) {
-	logger.Debugw(ctx, "reconciling - completed!", log.Fields{"device-id": dh.DeviceID})
-	dh.stopReconciling(ctx, true, cWaitReconcileFlowNoActivity)
 }
 
 func (dh *deviceHandler) deleteDevicePersistencyData(ctx context.Context) error {
@@ -1996,275 +1981,136 @@ func (dh *deviceHandler) createInterface(ctx context.Context, onuind *oop.OnuInd
 	}
 	_ = dh.ReasonUpdate(ctx, cmn.DrStartingOpenomci, !dh.IsReconciling() || dh.IsReconcilingReasonUpdate())
 
-  parentDevice,err := dh.getDeviceFromCore(ctx, dh.parentID)
-  if err!=nil{
-    logger.Errorw(ctx, "Device is Not Exist", log.Fields{"device-id":dh.DeviceID})
+	/* this might be a good time for Omci Verify message?  */
+	verifyExec := make(chan bool)
+	omciVerify := otst.NewOmciTestRequest(log.WithSpanFromContext(context.TODO(), ctx),
+		dh.device.Id, pDevEntry.PDevOmciCC,
+		true, true) //exclusive and allowFailure (anyway not yet checked)
+	omciVerify.PerformOmciTest(log.WithSpanFromContext(context.TODO(), ctx), verifyExec)
 
-  }
-  if(parentDevice.Vendor=="ETRI"){
-    logger.Debugw(ctx, "Ver 0.1", log.Fields{"device-id":dh.DeviceID})
-    dh.SetOnuInformation(ctx,onuind)
-    pDevEntry.CreateMeDB(ctx)
-    pDevEntry.SaveScriptUploadOmcitoMeDb(ctx)
-    dh.AddCustomAllUniPorts(ctx)
-    dh.SetEtcdLikeToDownloadFsm(ctx)
-    dh.SetEtcdLikeToPMFsm(ctx)
-    dh.SetETCDLikeToUnlockFsm(ctx)
-    fileName := "pAgentOmci"
-    _, err := os.Stat(fileName)
-    if err!=nil && os.IsNotExist(err){
-      logger.Errorw(ctx, "OmciScript is Not Exist", log.Fields{"device-id":dh.DeviceID, "fileName":fileName})
-      panic(err)
-    }
-    data, err:= os.Open(fileName)
-    if err!=nil{
-      panic(err)
-    }
-
-    scanner :=bufio.NewScanner(data)
-    scanner.Split(bufio.ScanLines)
-    //scriptChan := make(chan bool)
-    for scanner.Scan(){
-      //pDevEntry.verifyDone = scriptChan
-      omciData := scanner.Text()
-      logger.Infow(ctx, "Scanned Omci Data", log.Fields{"Scan Omci :":omciData})
-      scriptTid := pDevEntry.PDevOmciCC.GetNextTid(false)
-//      createOmci := strconv.FormatInt(int64(scriptTid), 16)+omciData[4:]
-      createOmci := fmt.Sprintf("%04x", scriptTid)+omciData[4:88]
-      logger.Infow(ctx, "Create Omci Data", log.Fields{"Scan Omci :":createOmci})
-      omciRxCallbackPair := cmn.CallbackPair{
-        CbKey : scriptTid,
-        CbEntry:cmn.CallbackPairEntry{
-          CbRespChannel:nil,
-          CbFunction: dh.ReceiveScriptResponse,
-          FramePrint: true,
-        },
-      }
-      logger.Debugw(ctx, "script Omci start Sending", log.Fields{"Sending Omci :":createOmci})
-      data, err:= hex.DecodeString(createOmci)
-      if err!=nil{
-        panic(err)
-      }
-      logger.Debugw(ctx, "hex.DecodeString", log.Fields{"hex.DecodeString":data})
-      go pDevEntry.PDevOmciCC.Send(ctx, data, 10, 2, true, omciRxCallbackPair)
-    }
-  }else{
-    /* this might be a good time for Omci Verify message?  */
-    verifyExec := make(chan bool)
-    omciVerify := otst.NewOmciTestRequest(log.WithSpanFromContext(context.TODO(), ctx),
-    dh.device.Id, pDevEntry.PDevOmciCC,
-    true, true) //exclusive and allowFailure (anyway not yet checked)
-    omciVerify.PerformOmciTest(log.WithSpanFromContext(context.TODO(), ctx), verifyExec)
-
-    /* 	give the handler some time here to wait for the OMCi verification result
-    after Timeout start and try MibUpload FSM anyway
-    (to prevent stopping on just not supported OMCI verification from ONU) */
-    select {
-    case <-time.After(pDevEntry.PDevOmciCC.GetMaxOmciTimeoutWithRetries() * time.Second):
-      logger.Warnw(ctx, "omci start-verification timed out (continue normal)", log.Fields{"device-id": dh.DeviceID})
-    case testresult := <-verifyExec:
-      logger.Infow(ctx, "Omci start verification done", log.Fields{"device-id": dh.DeviceID, "result": testresult})
-    }
-
-    /* In py code it looks earlier (on activate ..)
-    # Code to Run OMCI Test Action
-    kwargs_omci_test_action = {
-      OmciTestRequest.DEFAULT_FREQUENCY_KEY:
-      OmciTestRequest.DEFAULT_COLLECTION_FREQUENCY
-    }
-    serial_number = device.serial_number
-    self._test_request = OmciTestRequest(self.core_proxy,
-    self.omci_agent, self.device_id,
-    AniG, serial_number,
-    self.logical_device_id,
-    exclusive=False,
-    **kwargs_omci_test_action)
-    ...
-    # Start test requests after a brief pause
-    if not self._test_request_started:
-    self._test_request_started = True
-    tststart = _STARTUP_RETRY_WAIT * (random.randint(1, 5))
-    reactor.callLater(tststart, self._test_request.start_collector)
-
-    */
-    /* which is then: in omci_test_request.py : */
-    /*
-    def start_collector(self, callback=None):
-    """
-    Start the collection loop for an adapter if the frequency > 0
-
-    :param callback: (callable) Function to call to collect PM data
-    """
-    self.logger.info("starting-pm-collection", device_name=self.name, default_freq=self.default_freq)
-    if callback is None:
-    callback = self.perform_test_omci
-
-    if self.lc is None:
-    self.lc = LoopingCall(callback)
-
-    if self.default_freq > 0:
-    self.lc.start(interval=self.default_freq / 10)
-
-    def perform_test_omci(self):
-    """
-    Perform the initial test request
-    """
-    ani_g_entities = self._device.configuration.ani_g_entities
-    ani_g_entities_ids = list(ani_g_entities.keys()) if ani_g_entities \
-    is not None else None
-    self._entity_id = ani_g_entities_ids[0]
-    self.logger.info('perform-test', entity_class=self._entity_class,
-    entity_id=self._entity_id)
-    try:
-    frame = MEFrame(self._entity_class, self._entity_id, []).test()
-    result = yield self._device.omci_cc.send(frame)
-    if not result.fields['omci_message'].fields['success_code']:
-    self.logger.info('Self-Test Submitted Successfully',
-    code=result.fields[
-    'omci_message'].fields['success_code'])
-    else:
-    raise TestFailure('Test Failure: {}'.format(
-      result.fields['omci_message'].fields['success_code']))
-      except TimeoutError as e:
-      self.deferred.errback(failure.Failure(e))
-
-      except Exception as e:
-      self.logger.exception('perform-test-Error', e=e,
-      class_id=self._entity_class,
-      entity_id=self._entity_id)
-      self.deferred.errback(failure.Failure(e))
-
-      */
-
-      // PM related heartbeat??? !!!TODO....
-      //self._heartbeat.Enabled = True
-
-      /* Note: Even though FSM calls look 'synchronous' here, FSM is running in background with the effect that possible errors
-      * 	 within the MibUpload are not notified in the OnuIndication response, this might be acceptable here,
-      *   as further OltAdapter processing may rely on the deviceReason event 'MibUploadDone' as a result of the FSM processing
-      *   otherwise some processing synchronization would be required - cmp. e.g TechProfile processing
-      */
-      //call MibUploadFSM - transition up to state UlStInSync
-      pMibUlFsm := pDevEntry.PMibUploadFsm.PFsm
-      if pMibUlFsm != nil {
-        if pMibUlFsm.Is(mib.UlStDisabled) {
-          if err := pMibUlFsm.Event(mib.UlEvStart); err != nil {
-            logger.Errorw(ctx, "MibSyncFsm: Can't go to state starting", log.Fields{"device-id": dh.DeviceID, "err": err})
-            return fmt.Errorf("can't go to state starting: %s", dh.DeviceID)
-          }
-          logger.Debugw(ctx, "MibSyncFsm", log.Fields{"device-id": dh.DeviceID, "state": string(pMibUlFsm.Current())})
-          //Determine ONU status and start/re-start MIB Synchronization tasks
-          //Determine if this ONU has ever synchronized
-          if pDevEntry.IsNewOnu() {
-            if err := pMibUlFsm.Event(mib.UlEvResetMib); err != nil {
-              logger.Errorw(ctx, "MibSyncFsm: Can't go to state resetting_mib", log.Fields{"device-id": dh.DeviceID, "err": err})
-              return fmt.Errorf("can't go to state resetting_mib: %s", dh.DeviceID)
-            }
-          } else {
-            if err := pMibUlFsm.Event(mib.UlEvVerifyAndStoreTPs); err != nil {
-              logger.Errorw(ctx, "MibSyncFsm: Can't go to state verify and store TPs", log.Fields{"device-id": dh.DeviceID, "err": err})
-              return fmt.Errorf("can't go to state verify and store TPs: %s", dh.DeviceID)
-            }
-            logger.Debugw(ctx, "state of MibSyncFsm", log.Fields{"device-id": dh.DeviceID, "state": string(pMibUlFsm.Current())})
-          }
-        } else {
-          logger.Errorw(ctx, "wrong state of MibSyncFsm - want: disabled", log.Fields{"have": string(pMibUlFsm.Current()),
-          "device-id": dh.DeviceID})
-          return fmt.Errorf("wrong state of MibSyncFsm: %s", dh.DeviceID)
-        }
-      } else {
-        logger.Errorw(ctx, "MibSyncFsm invalid - cannot be executed!!", log.Fields{"device-id": dh.DeviceID})
-        return fmt.Errorf("can't execute MibSync: %s", dh.DeviceID)
-      }
-      return nil
-    }
-    return nil
-}
-func (dh *deviceHandler) SetOnuInformation(ctx context.Context, onuind *oop.OnuIndication) error{
-  pDevEntry := dh.GetOnuDeviceEntry(ctx, true)
-  pDevEntry.SOnuPersistentData.PersVendorID = hex.EncodeToString(onuind.GetSerialNumber().GetVendorId())
-  snNumberPart := hex.EncodeToString(onuind.GetSerialNumber().GetVendorSpecific())
-  pDevEntry.SOnuPersistentData.PersSerialNumber = hex.EncodeToString(onuind.GetSerialNumber().GetVendorId()) + snNumberPart
-  return nil
-}
-func (dh *deviceHandler) AddCustomAllUniPorts(ctx context.Context) error{
-  _ = dh.ReasonUpdate(ctx, cmn.DrDiscoveryMibsyncComplete, !dh.IsReconciling())
-  uniCnt := uint8(0)
-  for i:=uint16(256); i<uint16(260); i++{
-    logger.Debugw(ctx, "Add PPTPEthUni ETRI UNI port", log.Fields{"device-id":dh.DeviceID, "PPTP Eth Uni ID": i})
-    dh.addUniPort(ctx, i, uniCnt, cmn.UniPPTP)
-    uniCnt++
-  }
-  dh.flowCbChan = make([]chan FlowCb, uniCnt)
-  dh.stopFlowMonitoringRoutine = make([]chan bool, uniCnt)
-  dh.isFlowMonitoringRoutineActive = make([]bool, uniCnt)
-  //chUniVlanConfigReconcilingDone needs to have the capacity of all UniPorts as flow reconcile may      run parallel for all of them
-  dh.chUniVlanConfigReconcilingDone = make(chan uint16, uniCnt)
-  for i := 0; i < int(uniCnt); i++ {
-    dh.flowCbChan[i] = make(chan FlowCb, dh.pOpenOnuAc.config.MaxConcurrentFlowsPerUni)
-    dh.stopFlowMonitoringRoutine[i] = make(chan bool)
-  }
-  return nil
-}
-
-func (dh *deviceHandler) SetEtcdLikeToDownloadFsm(ctx context.Context) error{
-  logger.Debugw(ctx, "call SetEtcdLikeToDownloadFsm ETRI PON", log.Fields{"device-id": dh.DeviceID})
-  if err := dh.updateDeviceStateInCore(ctx, &ca.DeviceStateFilter{
-    DeviceId: dh.DeviceID,
-    ConnStatus: voltha.ConnectStatus_REACHABLE,
-    OperStatus: voltha.OperStatus_ACTIVE,
-  });err!=nil{
-    logger.Errorw(ctx, "error-ETRI-DEVICE-UPDATE", log.Fields{"device-id":dh.DeviceID,"error":err})
-  }else {
-    logger.Debugw(ctx, "ETRI-DEVICE-UPDATE!!!", log.Fields{"device-id":dh.DeviceID})
-  }
-  _ = dh.ReasonUpdate(ctx, cmn.DrInitialMibDownloaded, !dh.IsReconciling())
-  for _, uniPort := range dh.uniEntityMap {
-  // only if this port was enabled for use by the operator at startup
-  if (1<<uniPort.UniID)&dh.pOpenOnuAc.config.UniPortMask == (1 << uniPort.UniID) {
-      if !dh.GetFlowMonitoringIsRunning(uniPort.UniID) {
-          go dh.PerOnuFlowHandlerRoutine(uniPort.UniID)
-        }
-      }
-  }
-  dh.SetReadyForOmciConfig(true)
-  if err := dh.pOnuMetricsMgr.PAdaptFsm.PFsm.Event(pmmgr.L2PmEventInit); err != nil {
-		// There is no way we should be landing here, but if we do then
-		// there is nothing much we can do about this other than log error
-		logger.Errorw(ctx, "error starting l2 pm fsm", log.Fields{"device-id": dh.device.Id, "err": err})
+	/* 	give the handler some time here to wait for the OMCi verification result
+	after Timeout start and try MibUpload FSM anyway
+	(to prevent stopping on just not supported OMCI verification from ONU) */
+	select {
+	case <-time.After(pDevEntry.PDevOmciCC.GetMaxOmciTimeoutWithRetries() * time.Second):
+		logger.Warnw(ctx, "omci start-verification timed out (continue normal)", log.Fields{"device-id": dh.DeviceID})
+	case testresult := <-verifyExec:
+		logger.Infow(ctx, "Omci start verification done", log.Fields{"device-id": dh.DeviceID, "result": testresult})
 	}
 
+	/* In py code it looks earlier (on activate ..)
+			# Code to Run OMCI Test Action
+			kwargs_omci_test_action = {
+				OmciTestRequest.DEFAULT_FREQUENCY_KEY:
+					OmciTestRequest.DEFAULT_COLLECTION_FREQUENCY
+			}
+			serial_number = device.serial_number
+			self._test_request = OmciTestRequest(self.core_proxy,
+											self.omci_agent, self.device_id,
+											AniG, serial_number,
+											self.logical_device_id,
+											exclusive=False,
+											**kwargs_omci_test_action)
+	...
+	                    # Start test requests after a brief pause
+	                    if not self._test_request_started:
+	                        self._test_request_started = True
+	                        tststart = _STARTUP_RETRY_WAIT * (random.randint(1, 5))
+	                        reactor.callLater(tststart, self._test_request.start_collector)
 
-  return nil
+	*/
+	/* which is then: in omci_test_request.py : */
+	/*
+	   def start_collector(self, callback=None):
+	       """
+	               Start the collection loop for an adapter if the frequency > 0
+
+	               :param callback: (callable) Function to call to collect PM data
+	       """
+	       self.logger.info("starting-pm-collection", device_name=self.name, default_freq=self.default_freq)
+	       if callback is None:
+	           callback = self.perform_test_omci
+
+	       if self.lc is None:
+	           self.lc = LoopingCall(callback)
+
+	       if self.default_freq > 0:
+	           self.lc.start(interval=self.default_freq / 10)
+
+	   def perform_test_omci(self):
+	       """
+	       Perform the initial test request
+	       """
+	       ani_g_entities = self._device.configuration.ani_g_entities
+	       ani_g_entities_ids = list(ani_g_entities.keys()) if ani_g_entities \
+	                                                     is not None else None
+	       self._entity_id = ani_g_entities_ids[0]
+	       self.logger.info('perform-test', entity_class=self._entity_class,
+	                     entity_id=self._entity_id)
+	       try:
+	           frame = MEFrame(self._entity_class, self._entity_id, []).test()
+	           result = yield self._device.omci_cc.send(frame)
+	           if not result.fields['omci_message'].fields['success_code']:
+	               self.logger.info('Self-Test Submitted Successfully',
+	                             code=result.fields[
+	                                 'omci_message'].fields['success_code'])
+	           else:
+	               raise TestFailure('Test Failure: {}'.format(
+	                   result.fields['omci_message'].fields['success_code']))
+	       except TimeoutError as e:
+	           self.deferred.errback(failure.Failure(e))
+
+	       except Exception as e:
+	           self.logger.exception('perform-test-Error', e=e,
+	                              class_id=self._entity_class,
+	                              entity_id=self._entity_id)
+	           self.deferred.errback(failure.Failure(e))
+
+	*/
+
+	// PM related heartbeat??? !!!TODO....
+	//self._heartbeat.Enabled = True
+
+	/* Note: Even though FSM calls look 'synchronous' here, FSM is running in background with the effect that possible errors
+	 * 	 within the MibUpload are not notified in the OnuIndication response, this might be acceptable here,
+	 *   as further OltAdapter processing may rely on the deviceReason event 'MibUploadDone' as a result of the FSM processing
+	 *   otherwise some processing synchronization would be required - cmp. e.g TechProfile processing
+	 */
+	//call MibUploadFSM - transition up to state UlStInSync
+	pMibUlFsm := pDevEntry.PMibUploadFsm.PFsm
+	if pMibUlFsm != nil {
+		if pMibUlFsm.Is(mib.UlStDisabled) {
+			if err := pMibUlFsm.Event(mib.UlEvStart); err != nil {
+				logger.Errorw(ctx, "MibSyncFsm: Can't go to state starting", log.Fields{"device-id": dh.DeviceID, "err": err})
+				return fmt.Errorf("can't go to state starting: %s", dh.DeviceID)
+			}
+			logger.Debugw(ctx, "MibSyncFsm", log.Fields{"device-id": dh.DeviceID, "state": string(pMibUlFsm.Current())})
+			//Determine ONU status and start/re-start MIB Synchronization tasks
+			//Determine if this ONU has ever synchronized
+			if pDevEntry.IsNewOnu() {
+				if err := pMibUlFsm.Event(mib.UlEvResetMib); err != nil {
+					logger.Errorw(ctx, "MibSyncFsm: Can't go to state resetting_mib", log.Fields{"device-id": dh.DeviceID, "err": err})
+					return fmt.Errorf("can't go to state resetting_mib: %s", dh.DeviceID)
+				}
+			} else {
+				if err := pMibUlFsm.Event(mib.UlEvVerifyAndStoreTPs); err != nil {
+					logger.Errorw(ctx, "MibSyncFsm: Can't go to state verify and store TPs", log.Fields{"device-id": dh.DeviceID, "err": err})
+					return fmt.Errorf("can't go to state verify and store TPs: %s", dh.DeviceID)
+				}
+				logger.Debugw(ctx, "state of MibSyncFsm", log.Fields{"device-id": dh.DeviceID, "state": string(pMibUlFsm.Current())})
+			}
+		} else {
+			logger.Errorw(ctx, "wrong state of MibSyncFsm - want: disabled", log.Fields{"have": string(pMibUlFsm.Current()),
+				"device-id": dh.DeviceID})
+			return fmt.Errorf("wrong state of MibSyncFsm: %s", dh.DeviceID)
+		}
+	} else {
+		logger.Errorw(ctx, "MibSyncFsm invalid - cannot be executed!!", log.Fields{"device-id": dh.DeviceID})
+		return fmt.Errorf("can't execute MibSync: %s", dh.DeviceID)
+	}
+	return nil
 }
-func (dh *deviceHandler) SetEtcdLikeToPMFsm(ctx context.Context) error{
-  return nil
-}
 
-func (dh *deviceHandler) SetETCDLikeToUnlockFsm(ctx context.Context) error{
-  dh.EnableUniPortStateUpdate(ctx)
-  logger.Infow(ctx, "ETRI UniUnlockStateDone event: Sending OnuUp event", log.Fields{"device-id": dh.DeviceID})
-  raisedTs := time.Now().Unix()
-  go dh.sendOnuOperStateEvent(ctx, voltha.OperStatus_ACTIVE, dh.DeviceID, raisedTs)
-    pDevEntry :=dh.GetOnuDeviceEntry(ctx, false)
-  if pDevEntry == nil{
-    logger.Errorw(ctx, "No valid OnuDevice - aborting", log.Fields{"device-id": dh.DeviceID})
-    return nil
-  }
-  pDevEntry.MutexPersOnuConfig.Lock()
-  pDevEntry.SOnuPersistentData.PersUniUnlockDone = true
-  pDevEntry.MutexPersOnuConfig.Unlock()
-
-  if err := dh.StorePersistentData(ctx); err !=nil{
-    logger.Warnw(ctx, "store persistent ETRI data error - continue for now as there will be additional write attempts",log.Fields{"device-id": dh.DeviceID, "err": err})
-  }else{
-    logger.Debugw(ctx, "store persistent ETRI data success - continue for now as there will be additional write attempts",log.Fields{"device-id": dh.DeviceID})
-
-  }
-  return nil
-
-
-}
 func (dh *deviceHandler) updateInterface(ctx context.Context, onuind *oop.OnuIndication) error {
 	//state checking to prevent unneeded processing (eg. on ONU 'unreachable' and 'down')
 	// (but note that the deviceReason may also have changed to e.g. TechProf*Delete_Success in between)
@@ -2551,7 +2397,7 @@ func (dh *deviceHandler) processMibDownloadDoneEvent(ctx context.Context, devEve
 		pDevEntry.MutexPersOnuConfig.RUnlock()
 		logger.Debugw(ctx, "reconciling - uni-ports were disabled by admin before adapter restart - keep the ports locked",
 			log.Fields{"device-id": dh.DeviceID})
-		go dh.ReconcileDeviceTechProf(ctx)
+		dh.ReconcileDeviceTechProf(ctx)
 		// reconcilement will be continued after ani config is done
 	} else {
 		pDevEntry.MutexPersOnuConfig.RUnlock()
@@ -2587,7 +2433,7 @@ func (dh *deviceHandler) processUniUnlockStateDoneEvent(ctx context.Context, dev
 	} else {
 		logger.Debugw(ctx, "reconciling - don't notify core that onu went to active but trigger tech profile config",
 			log.Fields{"device-id": dh.DeviceID})
-		go dh.ReconcileDeviceTechProf(ctx)
+		dh.ReconcileDeviceTechProf(ctx)
 		// reconcilement will be continued after ani config is done
 	}
 }
@@ -2683,7 +2529,15 @@ func (dh *deviceHandler) processOmciAniConfigDoneEvent(ctx context.Context, devE
 			_ = dh.ReasonUpdate(ctx, cmn.DrTechProfileConfigDownloadSuccess, !dh.IsReconciling() || dh.IsReconcilingReasonUpdate())
 		}
 		if dh.IsReconciling() {
-			go dh.ReconcileDeviceFlowConfig(ctx)
+			// during reconciling with OMCI configuration in TT multi-UNI scenario, OmciAniConfigDone is reached several times
+			// therefore it must be ensured that reconciling of flow config is only started on the first pass of this code position
+			dh.mutexReconcilingFirstPassFlag.Lock()
+			if dh.reconcilingFirstPass {
+				logger.Debugw(ctx, "reconciling - OmciAniConfigDone first pass, start flow processing", log.Fields{"device-id": dh.DeviceID})
+				dh.reconcilingFirstPass = false
+				go dh.ReconcileDeviceFlowConfig(ctx)
+			}
+			dh.mutexReconcilingFirstPassFlag.Unlock()
 		}
 	} else { // should be the OmciAniResourceRemoved block
 		logger.Debugw(ctx, "OmciAniResourceRemoved event received", log.Fields{"device-id": dh.DeviceID})
@@ -2707,9 +2561,6 @@ func (dh *deviceHandler) processOmciVlanFilterDoneEvent(ctx context.Context, aDe
 			// which may be the case from some previous activity on another UNI Port of the ONU
 			// or even some previous flow add activity on the same port
 			_ = dh.ReasonUpdate(ctx, cmn.DrOmciFlowsPushed, !dh.IsReconciling() || dh.IsReconcilingReasonUpdate())
-			if dh.IsReconciling() {
-				go dh.reconcileEnd(ctx)
-			}
 		}
 	} else {
 		if dh.getDeviceReason() != cmn.DrOmciFlowsDeleted {
@@ -4209,6 +4060,7 @@ func (dh *deviceHandler) StartReconciling(ctx context.Context, skipOnuConfig boo
 			dh.reconciling = cNoReconciling
 			dh.mutexReconcilingFlag.Unlock()
 			dh.SetReconcilingReasonUpdate(false)
+			dh.SetReconcilingFirstPass(true)
 
 			if onuDevEntry := dh.GetOnuDeviceEntry(ctx, true); onuDevEntry == nil {
 				logger.Errorw(ctx, "No valid OnuDevice", log.Fields{"device-id": dh.DeviceID})
@@ -4250,6 +4102,12 @@ func (dh *deviceHandler) IsSkipOnuConfigReconciling() bool {
 	dh.mutexReconcilingFlag.RLock()
 	defer dh.mutexReconcilingFlag.RUnlock()
 	return dh.reconciling == cSkipOnuConfigReconciling
+}
+
+func (dh *deviceHandler) SetReconcilingFirstPass(value bool) {
+	dh.mutexReconcilingFirstPassFlag.Lock()
+	dh.reconcilingFirstPass = value
+	dh.mutexReconcilingFirstPassFlag.Unlock()
 }
 
 func (dh *deviceHandler) SetReconcilingReasonUpdate(value bool) {
@@ -4610,19 +4468,50 @@ func (dh *deviceHandler) anyTpPathExists(aTpPathMap map[uint8]string) bool {
 	}
 	return tpPathFound
 }
-func (dh *deviceHandler) ReceiveScriptResponse(ctx context.Context, omciMsg *omci.OMCI, packet *gp.Packet, respChan chan cmn.Message) error {
 
-  logger.Debugw(ctx, "Receive-Script-message-response received:", log.Fields{"omciMsgType": omciMsg.MessageType, "transCorrId": omciMsg.TransactionID, "DeviceIdent": omciMsg.DeviceIdentifier})
-  pDevEntry := dh.GetOnuDeviceEntry(ctx, true)
+// PrepareForGarbageCollection - remove references to prepare for garbage collection
+func (dh *deviceHandler) PrepareForGarbageCollection(ctx context.Context, aDeviceID string) {
+	logger.Debugw(ctx, "prepare for garbage collection", log.Fields{"device-id": aDeviceID})
 
-  pDevEntry.PDevOmciCC.RLockMutexMonReq()
-  if _, exist := pDevEntry.PDevOmciCC.GetMonitoredRequest(omciMsg.TransactionID); exist {
-    pDevEntry.PDevOmciCC.SetChMonitoredRequest(omciMsg.TransactionID, true)
-  } else {
-    logger.Infow(ctx, "reqMon: map entry does not exist!",
-    log.Fields{"tid": omciMsg.TransactionID, "device-id": dh.DeviceID})
-  }
-  pDevEntry.PDevOmciCC.RUnlockMutexMonReq()
-//  pDevEntry.verifyDone<-true
-  return nil
+	// Note: This function must be called as a goroutine to prevent blocking of further processing!
+	// first let the objects rest for some time to give all asynchronously started
+	// cleanup routines a chance to come to an end
+	time.Sleep(5 * time.Second)
+
+	if dh.pOnuTP != nil {
+		dh.pOnuTP.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pOnuMetricsMgr != nil {
+		dh.pOnuMetricsMgr.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pAlarmMgr != nil {
+		dh.pAlarmMgr.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pSelfTestHdlr != nil {
+		dh.pSelfTestHdlr.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pLockStateFsm != nil {
+		dh.pLockStateFsm.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pUnlockStateFsm != nil {
+		dh.pUnlockStateFsm.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pOnuUpradeFsm != nil {
+		dh.pOnuUpradeFsm.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	if dh.pOnuOmciDevice != nil {
+		dh.pOnuOmciDevice.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	for k, v := range dh.UniVlanConfigFsmMap {
+		v.PrepareForGarbageCollection(ctx, aDeviceID)
+		delete(dh.UniVlanConfigFsmMap, k)
+	}
+	dh.pOnuOmciDevice = nil
+	dh.pOnuTP = nil
+	dh.pOnuMetricsMgr = nil
+	dh.pAlarmMgr = nil
+	dh.pSelfTestHdlr = nil
+	dh.pLockStateFsm = nil
+	dh.pUnlockStateFsm = nil
+	dh.pOnuUpradeFsm = nil
 }

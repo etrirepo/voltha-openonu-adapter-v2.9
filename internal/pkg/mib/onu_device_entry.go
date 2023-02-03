@@ -191,9 +191,11 @@ type OnuDeviceEntry struct {
 	//mibNextDbResync uint32
 
 	// for mibUpload
-	PMibUploadFsm          *cmn.AdapterFsm //could be handled dynamically and more general as pcmn.AdapterFsm - perhaps later
-	mutexLastTxParamStruct sync.RWMutex
-	lastTxParamStruct      sLastTxMeParameter
+	PMibUploadFsm                   *cmn.AdapterFsm //could be handled dynamically and more general as pcmn.AdapterFsm - perhaps later
+	mutexLastTxParamStruct          sync.RWMutex
+	lastTxParamStruct               sLastTxMeParameter
+	mibSyncMsgProcessorRunning      bool
+	mutexMibSyncMsgProcessorRunning sync.RWMutex
 	// for mibDownload
 	PMibDownloadFsm *cmn.AdapterFsm //could be handled dynamically and more general as pcmn.AdapterFsm - perhaps later
 	//remark: general usage of pAdapterFsm would require generalization of CommChan  usage and internal event setting
@@ -985,4 +987,15 @@ func (oo *OnuDeviceEntry) isReconcilingFlows() bool {
 	value := oo.reconcilingFlows
 	oo.mutexReconcilingFlowsFlag.RUnlock()
 	return value
+}
+
+// PrepareForGarbageCollection - remove references to prepare for garbage collection
+func (oo *OnuDeviceEntry) PrepareForGarbageCollection(ctx context.Context, aDeviceID string) {
+	logger.Debugw(ctx, "prepare for garbage collection", log.Fields{"device-id": aDeviceID})
+	oo.baseDeviceHandler = nil
+	oo.pOnuTP = nil
+	if oo.PDevOmciCC != nil {
+		oo.PDevOmciCC.PrepareForGarbageCollection(ctx, aDeviceID)
+	}
+	oo.PDevOmciCC = nil
 }

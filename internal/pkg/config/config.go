@@ -26,7 +26,7 @@ import (
 // Open ONU default constants
 const (
 	EtcdStoreName = "etcd"
-	OnuVendorIds  = "OPEN,ALCL,BRCM,TWSH,ALPH,ISKT,SFAA,BBSM,SCOM,ARPX,DACM,ERSN,HWTC,CIGG,ADTN,ARCA,AVMG"
+	OnuVendorIds  = "OPEN,ALCL,BRCM,TWSH,ALPH,ISKT,SFAA,BBSM,SCOM,ARPX,DACM,ERSN,HWTC,CIGG,ADTN,ARCA,AVMG,ETRI"
 )
 
 // AdapterFlags represents the set of configurations used by the read-write adaptercore service
@@ -216,7 +216,7 @@ func (so *AdapterFlags) ParseCommandArguments(args []string) {
 
 	fs.DurationVar(&(so.OmciTimeout),
 		"omci_timeout",
-		3*time.Second,
+		20*time.Second,
 		"OMCI timeout duration - this timeout value is used on the OMCI channel for waiting on response from ONU")
 
 	fs.DurationVar(&(so.AlarmAuditInterval),

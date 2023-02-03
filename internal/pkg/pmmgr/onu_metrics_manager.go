@@ -63,7 +63,7 @@ const CL2PmFsmIdleState = L2PmStIdle
 
 // general constants used for overall Metric Collection management
 const (
-	DefaultMetricCollectionFrequency = 15 * 60 // unit in seconds. This setting can be changed from voltha NBI PmConfig configuration
+	DefaultMetricCollectionFrequency = 1 * 60 // unit in seconds. This setting can be changed from voltha NBI PmConfig configuration
 	GroupMetricEnabled               = true    // This is READONLY and cannot be changed from VOLTHA NBI
 	DefaultFrequencyOverrideEnabled  = true    // This is READONLY and cannot be changed from VOLTHA NBI
 	FrequencyGranularity             = 5       // The frequency (in seconds) has to be multiple of 5. This setting cannot changed later.
@@ -3871,4 +3871,11 @@ func (mm *OnuMetricsManager) getControlBlockForExtendedPMDirection(ctx context.C
 	// Next two bytes are for reserved bits - does not matter here
 	controlBlock[7] = 0
 	return controlBlock
+}
+
+// PrepareForGarbageCollection - remove references to prepare for garbage collection
+func (mm *OnuMetricsManager) PrepareForGarbageCollection(ctx context.Context, aDeviceID string) {
+	logger.Debugw(ctx, "prepare for garbage collection", log.Fields{"device-id": aDeviceID})
+	mm.pDeviceHandler = nil
+	mm.pOnuDeviceEntry = nil
 }

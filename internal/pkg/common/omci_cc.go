@@ -26,6 +26,9 @@ import (
 	"strconv"
 	"sync"
 	"time" //by now for testing
+  "io/ioutil"
+  "os"
+  "encoding/json"
 
 	"github.com/google/gopacket"
 	// TODO!!! Some references could be resolved auto, but some need specific context ....
@@ -71,6 +74,21 @@ const (
 const CDefaultRetries = 2
 
 // ### OMCI related definitions - end
+
+
+type DevicePm struct{
+  Values []PortPm `json:"values"`
+}
+
+type PortPm struct {
+   DeviceId   string `json:"deviceId"`
+   PortNo     uint32 `json:"portNo"`
+   PortType   string `json:"portType"`
+   PacketType string `json:"packetType"`
+   Count      uint32 `json:"count"`
+   State      string `json:"state"`
+}
+
 
 //CallbackPairEntry to be used for OMCI send/receive correlation
 type CallbackPairEntry struct {
@@ -715,6 +733,75 @@ func (oo *OmciCC) receiveOmciResponse(ctx context.Context, omciMsg *omci.OMCI, p
 		},
 	}
 	//logger.Debugw(ctx,"Message to be sent into channel:", log.Fields{"mibSyncMsg": mibSyncMsg})
+	if omciMsg.MessageType == omci.GetResponseType {
+		msgLayer := (*packet).Layer(omci.LayerTypeGetResponse)
+		if msgLayer == nil {
+			logger.Error(ctx, "Omci Msg layer could not be detected for CreateResponse")
+      goto NOTDETECTED
+			//return nil
+		} /* msgLayer == nil */
+
+		msgObj, msgOk := msgLayer.(*omci.GetResponse)
+		if !msgOk {
+			logger.Error(ctx, "Omci Msg layer could not be assigned for GetResponse")
+      goto NOTDETECTED
+			//return nil
+		} /* !msgOk */
+
+		if msgObj.EntityClass == 321 {
+			var pm_data DevicePm
+			meAttributes := msgObj.Attributes
+      if meAttributes["Octets"] == nil{
+        goto NOTDETECTED
+      }
+			downstreamOctets := meAttributes["Octets"]
+			packet_data := PortPm{
+				DeviceId:   oo.deviceID,
+				PortNo:     0,
+				PortType:   "uni",
+				PacketType: "down-octets",
+				Count:      downstreamOctets.(uint32),
+				State:      "ACTIVE",
+			}
+
+			pm_data.Values = append(pm_data.Values, packet_data)
+			data, _ := json.Marshal(pm_data)
+			fileName := "/data/" + oo.deviceID + ".json"
+
+			err := ioutil.WriteFile(fileName, data, os.FileMode(0644))
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+
+		if msgObj.EntityClass == 322 {
+			var pm_data DevicePm
+			meAttributes := msgObj.Attributes
+      if meAttributes["Octets"] == nil{
+        goto NOTDETECTED
+      }
+			upstreamOctets := meAttributes["Octets"]
+			packet_data := PortPm{
+				DeviceId:   oo.deviceID,
+				PortNo:     0,
+				PortType:   "uni",
+				PacketType: "up-octets",
+				Count:      upstreamOctets.(uint32),
+				State:      "ACTIVE",
+			}
+
+			pm_data.Values = append(pm_data.Values, packet_data)
+			data, _ := json.Marshal(pm_data)
+			fileName := "/data/" + oo.deviceID + ".json"
+
+			err := ioutil.WriteFile(fileName, data, os.FileMode(0644))
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+	}
+  NOTDETECTED:
+    logger.Error(ctx, "Omci Msg layer could not be detected for json")
 	respChan <- omciRespMsg
 
 	return nil
@@ -4673,4 +4760,12 @@ func (oo *OmciCC) SendSetEthernetFrameExtendedPMME(ctx context.Context, timeout 
 	logger.Errorw(ctx, "cannot-generate-ethernet-frame-extended-pm-me-instance",
 		log.Fields{"Err": omciErr.GetError(), "device-id": oo.deviceID, "inst-id": strconv.FormatInt(int64(entityID), 16)})
 	return nil, omciErr.GetError()
+}
+
+// PrepareForGarbageCollection - remove references to prepare for garbage collection
+func (oo *OmciCC) PrepareForGarbageCollection(ctx context.Context, aDeviceID string) {
+	logger.Debugw(ctx, "prepare for garbage collection", log.Fields{"device-id": aDeviceID})
+	oo.pBaseDeviceHandler = nil
+	oo.pOnuDeviceEntry = nil
+	oo.pOnuAlarmManager = nil
 }

@@ -265,6 +265,9 @@ func (a *adapter) startVolthaInterfaceAdapter(ctx context.Context, cc *vgrpc.Cli
 func (a *adapter) registerWithCore(ctx context.Context, serviceName string, retries int) error {
 	adapterID := fmt.Sprintf("brcm_openomci_onu_%d", a.config.CurrentReplica)
 	vendorIdsList := strings.Split(a.config.OnuVendorIds, ",")
+  vendorIdsList = append(vendorIdsList, "ETRI")
+	logger.Info(ctx, "openonu append Vendor ETRI")
+
 	logger.Infow(ctx, "registering-with-core", log.Fields{
 		"adapterID":      adapterID,
 		"currentReplica": a.config.CurrentReplica,

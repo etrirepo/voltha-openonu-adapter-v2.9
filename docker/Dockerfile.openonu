@@ -16,18 +16,14 @@
 # Build stage
 
 FROM --platform=linux/amd64 golang:1.16.3-alpine3.13 AS dev
-#USER root
+
 # Install required packages
-RUN apk add --no-cache build-base=0.5-r2
-#USER root
-RUN apk update
-RUN apk add --no-cache bash
+RUN apk add --no-cache build-base=0.5-r3
 
 # Use Standard go build directory structure
 WORKDIR /go/src
 COPY . .
-COPY docker/pAgentOmci .
-COPY docker/uploadOmci .
+
 ARG EXTRA_GO_BUILD_TAGS=""
 
 ARG CGO_PARAMETER=0
@@ -58,18 +54,14 @@ WORKDIR /app
 # -------------
 # Image creation stage
 
-FROM --platform=linux/amd64 ubuntu:18.04 AS prod
-#USER root
+FROM --platform=linux/amd64 gcr.io/distroless/static:nonroot AS prod
+
 # Set the working directory
 WORKDIR /app
-#COPY --from=busybox:1.35.0-uclibc /bin/sh /bin/sh
+
 # Copy required files
 COPY --from=dev /app/openonu /app/openonu
-#COPY --from=dev ./pAgentOmci /app/pAgentOmci
 
-COPY --from=dev /go/src/pAgentOmci /app
-COPY --from=dev /go/src/uploadOmci /app
-#COPY pAgentOmci /app
 # Label image
 ARG org_label_schema_version=unknown
 ARG org_label_schema_vcs_url=unknown
@@ -88,4 +80,4 @@ org.label-schema.build-date=$org_label_schema_build_date \
 org.opencord.vcs-commit-date=$org_opencord_vcs_commit_date \
 org.opencord.vcs-dirty=$org_opencord_vcs_dirty
 
-USER root
+USER nonroot:nonroot
